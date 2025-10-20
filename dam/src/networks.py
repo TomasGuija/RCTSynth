@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from . import layers
-from .utils import default_unet_features
+from .utils import default_unet_features, default_encoder_features
 from .modelio import LoadableModel, store_config_args
 
 

@@ -17,12 +17,12 @@
 		"kl_weight": 0.1,
 
 	"_S3_": "Data hyperparameters",
-		"xkey": "pCT",
-		"ykey": "rCT",
+		"xkey": "planning",
+		"ykey": "repeated",
 		"max": 3000,
 		"min": -1000,
 
 	"_S4_": "Hardware hyperparameters",
         "shuffle": true,
-        "num_workers": 2
+        "num_workers": 0
 }

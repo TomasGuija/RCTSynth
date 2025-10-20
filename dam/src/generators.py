@@ -12,8 +12,8 @@ class Volumes(Dataset):
     inside a single .h5 file.
     """
 
-    def __init__(self, list_IDs, file_handle, masks=False, xkey='pCT',
-        ykey='rCT', xmask='pCST', ymask='rCST', maxv=1, minv=0):
+    def __init__(self, list_IDs, file_handle, masks=False, xkey='planning',
+        ykey='repeated', xmask='masks_planning', ymask='masks_repeated', maxv=1, minv=0):
         """
         Parameters:
             list_IDs: a list with the file identifiers.

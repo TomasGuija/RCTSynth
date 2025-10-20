@@ -1,0 +1,69 @@
+# configs/dam.yaml
+trainer:
+  max_epochs: 1000
+  accelerator: auto       # "gpu" to force
+  devices: auto
+  log_every_n_steps: 50
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val/loss_total
+        mode: min
+        save_top_k: 1
+        filename: "best"
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        every_n_epochs: 20
+        save_top_k: -1
+        filename: "{epoch:04d}"
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: epoch
+  logger:
+    - class_path: lightning.pytorch.loggers.WandbLogger
+      init_args:
+        project: "RCTSynth"
+        save_dir: "wandb"
+        log_model: true
+        entity: "Promise_urjc"
+  default_root_dir: models  # Lightning will make timestamped subdirs here
+
+# DataModule init args
+data:
+  dataset_path: dam/data/mini.h5
+  xkey: planning
+  ykey: repeated
+  xmask: masks_planning
+  ymask: masks_repeated
+  train_split: 0.95
+  batch_size: 16
+  num_workers: 0
+  shuffle: true
+  maxv: 1.0
+  minv: 0.0
+
+# DamLightning init args
+model:
+  lr: 1.0e-3
+  image_loss: ncc          # or "mse"
+  lambda_img: 1.0
+  kappa: 1.0
+  beta: 0.01
+  kl_weight: 1.0
+  bidir: true
+  latent_dim: 32
+  enc_nf: [16, 32, 32, 32]
+  dec_nf: [32, 32, 32, 16]
+  int_steps: 7
+  int_downsize: 2
+  conv_per_level: 1
+  prior: normal
+  num_organs: 1
+  cudnn_nondet: false
+
+  log_images_every_n_epochs: 50   # log visuals every N val epochs
+  vis_num_pairs: 5               # how many (GT, Recon) pairs to log each time
+  vis_slice_mode: mid            # mid | mip | index
+  vis_slice_index: null          # if mode=index, choose the Z slice (int)
+  vis_channel: 0                 # which input/target channel to display
+  vis_normalize_per_image: true  # min-max normalize each image before logging
