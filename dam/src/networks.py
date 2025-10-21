@@ -120,68 +120,48 @@ class Encoder(nn.Module):
 
 class Generator(nn.Module):
     """
-    Probabilistic decoder unet architecture. Layer features can be specified directly as a list of encoder 
-    and decoder features or as a single integer along with a number of unet levels. The default network
-    features per layer (when no options are specified) are:
-
-        encoder: [16, 32, 32, 32]
-        decoder: [32, 32, 32, 32, 32, 16, 16]
+    Dual-encoder U-Net:
+      - Image encoder -> prior p(z|x), bottleneck features
+      - Anatomy encoder (masks) -> bottleneck features
+      - Concatenate [image bottleneck, z, anatomy bottleneck] -> decoder
     """
-
-    def __init__(self,
-                 inshape=None,
-                 infeats=None,
-                 latent_dim=32,
-                 nb_features=None,
-                 nb_levels=None,
-                 max_pool=2,
-                 feat_mult=1,
-                 nb_conv_per_level=1,
-                 last_level=4,
-                 half_res=False):
-        """
-        Parameters:
-            inshape: Input shape. e.g. (192, 192, 192)
-            infeats: Number of input features.
-            nb_features: Unet convolutional features. Can be specified via a list of lists with
-                the form [[encoder feats], [decoder feats]], or as a single integer. 
-                If None (default), the unet features are defined by the default config described in 
-                the class documentation.
-            nb_levels: Number of levels in unet. Only used when nb_features is an integer. 
-                Default is None.
-            feat_mult: Per-level feature multiplier. Only used when nb_features is an integer. 
-                Default is 1.
-            nb_conv_per_level: Number of convolutions per unet level. Default is 1.
-            last_level: Number of features in the last encoder level.
-            half_res: Skip the last decoder upsampling. Default is False.
-        """
+    def __init__(
+        self,
+        inshape=None,
+        img_infeats=None,          
+        anat_infeats=None,
+        latent_dim=32,
+        nb_features=None,
+        nb_levels=None,
+        max_pool=2,
+        feat_mult=1,
+        nb_conv_per_level=1,
+        last_level=4,
+        half_res=False,
+    ):
         super().__init__()
 
-        # ensure correct dimensionality
         ndims = len(inshape)
-        assert ndims in [1, 2, 3], 'ndims should be one of 1, 2, or 3. found: %d' % ndims
-
-        # cache some parameters
+        assert ndims in [1, 2, 3], f'ndims should be 1, 2, or 3. found: {ndims}'
         self.half_res = half_res
         self.max_pool = max_pool
 
-        # default encoder and decoder layer features if nothing provided
+        # default features
         if nb_features is None:
             nb_features = default_unet_features()
 
-        # build feature list automatically
+        # feature list
         if isinstance(nb_features, int):
             if nb_levels is None:
-                raise ValueError('must provide unet nb_levels if nb_features is an integer')
+                raise ValueError('must provide nb_levels if nb_features is an integer')
             feats = np.round(nb_features * feat_mult ** np.arange(nb_levels)).astype(int)
             nb_features = [
                 np.repeat(feats[:-1], nb_conv_per_level),
-                np.repeat(np.flip(feats), nb_conv_per_level)
+                np.repeat(np.flip(feats), nb_conv_per_level),
             ]
         elif nb_levels is not None:
             raise ValueError('cannot use nb_levels if nb_features is not an integer')
 
-        # extract any surplus (full resolution) decoder convolutions
         enc_nf, dec_nf = nb_features
         nb_dec_convs = len(enc_nf)
         final_convs = dec_nf[nb_dec_convs:]
@@ -189,89 +169,137 @@ class Generator(nn.Module):
         self.nb_levels = int(nb_dec_convs / nb_conv_per_level)
 
         if isinstance(max_pool, int):
-            max_pool = [max_pool] * self.nb_levels
+            max_pool_list = [max_pool] * self.nb_levels
+        else:
+            max_pool_list = max_pool
+        MaxPooling = getattr(nn, f'MaxPool{ndims}d')
+        self.pooling = [MaxPooling(s) for s in max_pool_list]
+        self.upsampling = [nn.Upsample(scale_factor=s, mode='nearest') for s in max_pool_list]
 
-        # cache downsampling / upsampling operations
-        MaxPooling = getattr(nn, 'MaxPool%dd' % ndims)
-        self.pooling = [MaxPooling(s) for s in max_pool]
-        self.upsampling = [nn.Upsample(scale_factor=s, mode='nearest') for s in max_pool]
-        hidden_dim = tuple(int(i/(self.max_pool**self.nb_levels)) for i in inshape)
+        # compute bottleneck spatial shape (assumes integer max_pool scalar; if list, adapt accordingly)
+        hidden_dim = tuple(int(i / (self.max_pool ** self.nb_levels)) for i in inshape)
 
-        # down-sampling path
-        # configure encoder
-        prev_nf = infeats
-        encoder_nfs = [prev_nf]
-        self.encoder = nn.ModuleList()
+        # -------------------------
+        # IMAGE ENCODER (separate)
+        # -------------------------
+        prev_nf_img = img_infeats
+        encoder_nfs_img = [prev_nf_img]
+        self.img_encoder = nn.ModuleList()
         for level in range(self.nb_levels):
             convs = nn.ModuleList()
-            for conv in range(nb_conv_per_level):
-                nf = enc_nf[level * nb_conv_per_level + conv]
-                convs.append(ConvBlock(ndims, prev_nf, nf))
-                prev_nf = nf
-            self.encoder.append(convs)
-            encoder_nfs.append(prev_nf)
+            for k in range(nb_conv_per_level):
+                nf = enc_nf[level * nb_conv_per_level + k]
+                convs.append(ConvBlock(ndims, prev_nf_img, nf))
+                prev_nf_img = nf
+            self.img_encoder.append(convs)
+            encoder_nfs_img.append(prev_nf_img)
 
-        # predict prior distrbution parameters p(z|x)
-        self.last_conv = ConvBlock(ndims, prev_nf, last_level)
-        self.mu = nn.Linear(last_level*np.prod(hidden_dim), latent_dim)
-        self.logvar = nn.Linear(last_level*np.prod(hidden_dim), latent_dim)
+        # prior p(z|x) heads (image stream)
+        self.last_conv_img = ConvBlock(ndims, prev_nf_img, last_level)
+        self.mu     = nn.Linear(last_level * np.prod(hidden_dim), latent_dim)
+        self.logvar = nn.Linear(last_level * np.prod(hidden_dim), latent_dim)
 
-        # up-sampling path
-        # project and reshape latents to 2D/3D volume
-        self.fcn = FCBlock(latent_dim, last_level*np.prod(hidden_dim))
+        # -------------------------
+        # ANATOMY ENCODER (separate)
+        # -------------------------
+        prev_nf_anat = anat_infeats
+        self.anat_encoder = nn.ModuleList()
+        for level in range(self.nb_levels):
+            convs = nn.ModuleList()
+            for k in range(nb_conv_per_level):
+                nf = enc_nf[level * nb_conv_per_level + k]
+                convs.append(ConvBlock(ndims, prev_nf_anat, nf))
+                prev_nf_anat = nf
+            self.anat_encoder.append(convs)
+        # project anatomy bottleneck to fixed channels so it can be concatenated at bottleneck
+        self.anat_bottleneck = ConvBlock(ndims, prev_nf_anat, last_level)
+
+        # -------------------------
+        # LATENT -> feature volume
+        # -------------------------
+        self.fcn = FCBlock(latent_dim, last_level * np.prod(hidden_dim))
         self.reshape = nn.Unflatten(1, (last_level, *hidden_dim))
- 
-        # configure decoder
-        prev_nf += last_level
-        encoder_nfs = np.flip(encoder_nfs)
+
+        # -------------------------
+        # DECODER
+        # -------------------------
+        # decoder starts from the image-stream bottleneck (same tensor used to compute μ/logvar)
+        # we will concatenate z and (optionally) anatomy bottleneck, so grow the channel count:
+        prev_nf_dec_in = prev_nf_img + last_level * 2
+
+        encoder_nfs_img = np.flip(encoder_nfs_img)
         self.decoder = nn.ModuleList()
+        prev_nf = prev_nf_dec_in
         for level in range(self.nb_levels):
             convs = nn.ModuleList()
-            for conv in range(nb_conv_per_level):
-                nf = dec_nf[level * nb_conv_per_level + conv]
+            for k in range(nb_conv_per_level):
+                nf = dec_nf[level * nb_conv_per_level + k]
                 convs.append(ConvBlock(ndims, prev_nf, nf))
                 prev_nf = nf
             self.decoder.append(convs)
             if not half_res or level < (self.nb_levels - 1):
-                prev_nf += encoder_nfs[level]
+                prev_nf += encoder_nfs_img[level]  # image skips only
 
-        # remaining convolutions at upper level
         self.remaining = nn.ModuleList()
-        for num, nf in enumerate(final_convs):
+        for nf in final_convs:
             self.remaining.append(ConvBlock(ndims, prev_nf, nf))
             prev_nf = nf
-        
-        # configure unet to flow field layer
-        Conv = getattr(nn, 'Conv%dd' % ndims)
+
+        Conv = getattr(nn, f'Conv{ndims}d')
         flow_conv = Conv(prev_nf, ndims, kernel_size=3, padding=1)
         flow_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(flow_conv.weight.shape))
-        flow_conv.bias = nn.Parameter(torch.zeros(flow_conv.bias.shape))
-        self.flow = nn.Sequential(flow_conv, nn.Hardtanh(-2,2))
+        flow_conv.bias = nn.Parameter(torch.zeros_like(flow_conv.bias))
+        self.flow = nn.Sequential(flow_conv, nn.Hardtanh(-2, 2))
 
-    def forward(self, x, latents, prior=False):
+        # cache shapes/channels for forward
+        self.hidden_dim = hidden_dim
+        self.last_level = last_level
 
-        # encoder forward pass 
-        x_history = [x]
-        for level, convs in enumerate(self.encoder):
+    def forward(self, x_img, x_anat, latents, prior=False):
+        """
+        x_img:  (B, img_infeats, *inshape)
+        x_anat: (B, anat_infeats, *inshape) or None
+        latents: (B, latent_dim) ~ N(0, I) or any noise vector (if prior=True, reparam with μ, logvar)
+        """
+        # -------------------------
+        # IMAGE ENCODER + skips
+        # -------------------------
+        xi = x_img
+        x_history = [xi]
+        for level, convs in enumerate(self.img_encoder):
             for conv in convs:
-                x = conv(x)
-            x_history.append(x)
-            x = self.pooling[level](x)
+                xi = conv(xi)
+            x_history.append(xi)
+            xi = self.pooling[level](xi)
 
-        # output prior distribution parameters
-        h = torch.flatten(self.last_conv(x), start_dim=1)
+        # compute μ, logvar from image bottleneck
+        h = torch.flatten(self.last_conv_img(xi), start_dim=1)
         mu, logvar = self.mu(h), self.logvar(h)
 
-        # reperamatrize using prior parameters
-        if prior: latents = latents * torch.exp(0.5 * logvar) + mu
+        # sample reparameterized z from prior if requested
+        if prior:
+            latents = latents * torch.exp(0.5 * logvar) + mu
 
-        # linear and reshape latents
-        z = self.reshape(self.fcn(latents))
+        z = self.reshape(self.fcn(latents))  # (B, last_level, *hidden_dim)
 
-        # concatenate latent variables to encoded planning CT
-        x = torch.cat([x, z], dim=1)
+        # -------------------------
+        # ANATOMY ENCODER (bottleneck only)
+        # -------------------------
+        xa = x_anat
+        for level, convs in enumerate(self.anat_encoder):
+            for conv in convs:
+                xa = conv(xa)
+            xa = self.pooling[level](xa)
+        a = self.anat_bottleneck(xa)  # (B, anat_bottleneck_ch, *hidden_dim)
 
-        # decoder forward pass with upsampling and concatenation
+        # -------------------------
+        # Bottleneck concat: [image bottleneck, z, anatomy bottleneck]
+        # -------------------------
+        x = torch.cat([xi, z] + ([a] if a is not None else []), dim=1)
+
+        # -------------------------
+        # DECODER with image skips
+        # -------------------------
         for level, convs in enumerate(self.decoder):
             for conv in convs:
                 x = conv(x)
@@ -279,11 +307,9 @@ class Generator(nn.Module):
                 x = self.upsampling[level](x)
                 x = torch.cat([x, x_history.pop()], dim=1)
 
-        # remaining convs at full resolution
         for conv in self.remaining:
             x = conv(x)
 
-        # return unet output and distribution parameters    
         return self.flow(x), mu, logvar
 
 
@@ -303,8 +329,8 @@ class DamBase(LoadableModel):
                  int_steps=7,
                  int_downsize=2,
                  bidir=False,
-                 src_feats=2,
-                 trg_feats=2,
+                 src_feats=1,
+                 trg_feats=1,
                  unet_half_res=False,
                  last_level=4,
                  prior=False):
@@ -351,7 +377,8 @@ class DamBase(LoadableModel):
 
         self.generator = Generator(
             inshape=inshape,
-            infeats=src_feats,
+            img_infeats=src_feats,
+            anat_infeats=src_feats,
             nb_features=nb_unet_features,
             latent_dim=latent_dim,
             nb_levels=nb_unet_levels,
@@ -404,7 +431,7 @@ class DamBase(LoadableModel):
         Assumes latents are sampled from N(0,1)
         """
         svf, _, _ = self.generator(
-            torch.cat((planning, pmask.float()/4), axis=1), latents, prior=prior)
+            planning, pmask.float()/4, latents, prior=prior)
 
         # integrate and warp image
         pos_flow, neg_flow = self.to_dvf(svf)
@@ -438,9 +465,14 @@ class DamBase(LoadableModel):
     def forward(self, planning, repeat, pmask, rmask):
 
         # encode image pair and propagate latents
+
+        # latents, q_mu, q_logvar = self.encode(
+        #    torch.cat((planning, pmask.float()/4), dim=1), torch.cat((repeat, rmask.float()/4), dim=1))
+
+        # Only encode image information, to decouple from anatomical masks
         latents, q_mu, q_logvar = self.encode(
-            torch.cat((planning, pmask.float()/4), dim=1), torch.cat((repeat, rmask.float()/4), dim=1))
-        svf, p_mu, p_logvar = self.generator(torch.cat((planning, pmask.float()/4), dim=1), latents)
+            planning, repeat)
+        svf, p_mu, p_logvar = self.generator(planning, pmask.float()/4, latents)
 
         # store distribution parameters for KL loss
         param = {'q_mu':q_mu, 'q_logvar':q_logvar, 'p_mu':p_mu, 'p_logvar':p_logvar}
