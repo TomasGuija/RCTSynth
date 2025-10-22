@@ -3,6 +3,7 @@ from typing import Optional, Sequence
 import h5py
 from torch.utils.data import DataLoader, Dataset
 from lightning.pytorch import LightningDataModule
+import random
 import dam.src as dam
 
 class H5VolumesDataset(Dataset):
@@ -22,10 +23,12 @@ class H5VolumesDataset(Dataset):
         ymask: str,
         maxv: float,
         minv: float,
+        enable_swapping: bool = False,
     ):
         super().__init__()
         self.h5_path = h5_path
         self.indices = list(indices)
+        self.enable_swapping = enable_swapping
 
         # open per-worker file handle and build the inner dataset
         self._fh = h5py.File(self.h5_path, "r")
@@ -41,13 +44,26 @@ class H5VolumesDataset(Dataset):
             minv=minv,
         )
 
+        self._rng = random.Random()
+
     def __len__(self):
         return len(self._inner)
 
     def __getitem__(self, idx):
         # Returns exactly what your generator returns:
         #   (planning, repeat) or (planning, repeat, planning_mask, repeat_mask)
-        return self._inner[idx]
+        item = self._inner[idx] 
+
+        if self.enable_swapping and (self._rng.random() < 0.5):
+            if len(item) == 4:
+                x, y, xm, ym = item
+                return y, x, ym, xm
+            else:
+                x, y = item
+                return y, x
+
+        return item
+
 
     def __del__(self):
         try:
@@ -71,6 +87,7 @@ class DamDataModule(LightningDataModule):
         batch_size: int,
         num_workers: int,
         shuffle: bool,
+        enable_swapping: bool = False,
     ):
         super().__init__()
         self.dataset_path = dataset_path
@@ -84,6 +101,7 @@ class DamDataModule(LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.shuffle = shuffle
+        self.enable_swapping = enable_swapping
 
         # Discover N and inshape once (on main process)
         with h5py.File(self.dataset_path, "r") as fh:
@@ -110,6 +128,7 @@ class DamDataModule(LightningDataModule):
             ymask=self.ymask,
             maxv=self.maxv,
             minv=self.minv,
+            enable_swapping=self.enable_swapping,
         )
         self.val_set = H5VolumesDataset(
             h5_path=self.dataset_path,
@@ -121,6 +140,7 @@ class DamDataModule(LightningDataModule):
             ymask=self.ymask,
             maxv=self.maxv,
             minv=self.minv,
+            enable_swapping=False,
         )
 
     def train_dataloader(self):
