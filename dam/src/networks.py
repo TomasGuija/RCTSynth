@@ -102,6 +102,7 @@ class Encoder(nn.Module):
         stdev = torch.exp(0.5 * logvar)
         epsilon = torch.randn_like(stdev)
         latents = epsilon * stdev + mu
+        # NOTE: originally returned stdev instead of logvar. We assume that was unintentional.
         return latents, mu, logvar
 
     def forward(self, x):
@@ -246,6 +247,8 @@ class Generator(nn.Module):
         flow_conv = Conv(prev_nf, ndims, kernel_size=3, padding=1)
         flow_conv.weight = nn.Parameter(Normal(0, 1e-5).sample(flow_conv.weight.shape))
         flow_conv.bias = nn.Parameter(torch.zeros(flow_conv.bias.shape))
+        # NOTE: consider removing the Hardtanh here, as it may limit the expressiveness of the model.
+        # self.flow = flow_conv
         self.flow = nn.Sequential(flow_conv, nn.Hardtanh(-2,2))
 
     def forward(self, x, latents, prior=False):
@@ -325,8 +328,8 @@ class DamBase(LoadableModel):
             int_downsize: Integer specifying the flow downsample factor for vector integration. 
                 The flow field is not downsampled when this value is 1.
             bidir: Enable bidirectional cost function. Default is False.
-            src_feats: Number of planning image features. Default is 1.
-            trg_feats: Number of repeat image features. Default is 1.
+            src_feats: Number of planning image features. Default is 2.
+            trg_feats: Number of repeat image features. Default is 2.
             unet_half_res: Skip the last unet decoder upsampling. Requires that int_downsize=2. 
                 Default is False.
             last_level: Number of features in last Unet downsampling convolution.
