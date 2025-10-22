@@ -18,7 +18,8 @@ class DamLightning(LightningModule):
         lambda_img: float,
         kappa: float,
         beta: float,
-        kl_weight: float,
+        kl_weight_prior: float,
+        kl_weight_post: float, # Just set to 0 for original setup
         bidir: bool,
         latent_dim: int,
         enc_nf: List[int],
@@ -26,7 +27,7 @@ class DamLightning(LightningModule):
         int_steps: int,
         int_downsize: int,
         conv_per_level: int,
-        prior: str,
+        # prior: bool,
         num_organs: int = 1,
         cudnn_nondet: bool = False,
         log_images_every_n_epochs: int = 5,
@@ -41,7 +42,6 @@ class DamLightning(LightningModule):
         self.save_hyperparameters()
 
         self.model = None
-        self._loss_ready = False
         self._image_loss_name = image_loss
 
         self.lr = lr
@@ -61,6 +61,17 @@ class DamLightning(LightningModule):
         # cache for one epoch
         self._val_vis_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
 
+    def _model_outputs_to_dict(self, y_pred, bidir: bool) -> Dict[str, Any]:
+        """
+        Map your tuple outputs to named entries; no change to DamBase needed.
+        """
+        if bidir:
+            rep, inv, mrep, minv, svf, param = y_pred
+            return {"rep": rep, "inv": inv, "mrep": mrep, "minv": minv, "svf": svf, "param": param}
+        else:
+            rep, mrep, svf, param = y_pred
+            return {"rep": rep, "mrep": mrep, "svf": svf, "param": param}
+        
     def _pick_slice(self, vol: torch.Tensor) -> torch.Tensor:
         """
         vol: [B, C, X, Y, Z]
@@ -169,7 +180,7 @@ class DamLightning(LightningModule):
             panels.append(wandb.Image(fig, caption=f"pair {idx}"))
             plt.close(fig)
 
-        wb.experiment.log({ "val/examples_gt_vs_recon": panels, "epoch": self.current_epoch })
+        wb.experiment.log({ "train/examples_gt_vs_recon": panels, "epoch": self.current_epoch })
         self._val_vis_pairs.clear()
     # -------------------------- Lightning lifecycle --------------------------
 
@@ -188,50 +199,19 @@ class DamLightning(LightningModule):
                 bidir=self.hparams.bidir,
             )
 
-        if not self._loss_ready:
-            if self._image_loss_name == "ncc":
-                img_loss = dam.losses.NCC(device=self.device).loss
-            elif self._image_loss_name == "mse":
-                img_loss = dam.losses.MSE().loss
-            else:
-                raise ValueError(f"Invalid image_loss: {self._image_loss_name}")
+        if self._image_loss_name == "ncc":
+            self.img_loss = dam.losses.NCC(device=self.device).loss
+        elif self._image_loss_name == "mse":
+            self.img_loss = dam.losses.MSE().loss
+        else:
+            raise ValueError(f"Invalid image_loss: {self._image_loss_name}")
 
-            self.loss_fns: List[Any] = []
-            self.loss_wts: List[float] = []
-
-            if self.hparams.bidir:
-                self.loss_fns += [img_loss, img_loss]
-                self.loss_wts += [0.5 * self.hparams.lambda_img, 0.5 * self.hparams.lambda_img]
-                self.loss_fns += [dam.losses.Dice().loss, dam.losses.Dice().loss]
-                self.loss_wts += [self.hparams.kappa, self.hparams.kappa]
-            else:
-                self.loss_fns += [img_loss]
-                self.loss_wts += [self.hparams.lambda_img]
-                self.loss_fns += [dam.losses.Dice().loss]
-                self.loss_wts += [self.hparams.kappa]
-
-            self.loss_fns += [dam.losses.Grad("l2", loss_mult=self.hparams.int_downsize).loss]
-            self.loss_wts += [self.hparams.beta]
-
-            self.loss_fns += [dam.losses.KL(prior=self.hparams.prior).loss]
-            self.loss_wts += [self.hparams.kl_weight]
-
-            self._loss_ready = True
-
-            self.loss_names: List[str] = []
-            if self.hparams.bidir:
-                # name them clearly; tweak to your taste
-                self.loss_names += ["img_fwd", "img_bwd"]
-                self.loss_names += ["dice_fwd", "dice_bwd"]
-            else:
-                self.loss_names += ["img"]
-                self.loss_names += ["dice"]
-            self.loss_names += ["grad", "kl"]
-
-            assert len(self.loss_fns) == len(self.loss_wts) == len(self.loss_names)
+        self.dice_loss = dam.losses.Dice().loss
+        self.grad_loss = dam.losses.Grad("l2", loss_mult=self.hparams.int_downsize).loss
+        self.prior_KL = dam.losses.KL(prior=True).loss
+        self.post_KL = dam.losses.KL(prior=False).loss
 
     # ------------------------------- Train / Val ------------------------------
-
     def _step(self, batch: Tuple[torch.Tensor, ...], stage: str) -> Dict[str, torch.Tensor]:
         """
         batch: (planning, repeat, planning_mask, repeat_mask)
@@ -247,45 +227,49 @@ class DamLightning(LightningModule):
 
         # forward pass
         y_pred = self.model(inputs, y_true, pmasks, rmasks)
+        pred = self._model_outputs_to_dict(y_pred, self.bidir)
 
         # one-hot masks
         pmasks = self.model.to_binary(pmasks, num_organs=self.num_organs)
         rmasks = self.model.to_binary(rmasks, num_organs=self.num_organs)
 
-        # targets for each loss
+        comps: Dict[str, torch.Tensor] = {}
+
         if self.bidir:
-            targets = [y_true, inputs, rmasks, pmasks, 0, 0]
+            # image (planning->repeat) and (repeat->planning)
+            comps["img_fwd"]  = self.img_loss(y_true,  pred["rep"]) * self.hparams.lambda_img
+            comps["img_bwd"]  = self.img_loss(inputs, pred["inv"]) * self.hparams.lambda_img
+            # dice for warped masks
+            comps["dice_fwd"] = self.dice_loss(rmasks, pred["mrep"]) * self.hparams.kappa
+            comps["dice_bwd"] = self.dice_loss(pmasks, pred["minv"]) * self.hparams.kappa
         else:
-            targets = [y_true, rmasks, 0, 0]
+            comps["img"]  = self.img_loss(y_true,  pred["rep"])   * self.hparams.lambda_img
+            comps["dice"] = self.dice_loss(rmasks, pred["mrep"]) * self.hparams.kappa
 
-        total = 0.0
-        for i, (loss_fn, wt, name) in enumerate(zip(self.loss_fns, self.loss_wts, self.loss_names)):
-            tgt_i = targets[i]
-            pred_i = y_pred[i]  # keep the same ordering as in your original training loop
-            comp = loss_fn(tgt_i, pred_i) * wt
-            total = total + comp
+        comps["grad"] = self.grad_loss(None, pred["svf"]) * self.hparams.beta
 
-            # per-component logging with human-readable names
-            self.log(
-                f"{stage}/loss/{name}", comp,
-                on_step=False, on_epoch=True, sync_dist=True
-            )
+        def linear_warmup(epoch, target, start, end):
+            if epoch <= start: return 0.0
+            if epoch >= end:   return target
+            return target * (epoch - start) / max(1, end - start)
 
-        # total loss (used for backprop when stage=="train")
+        comps["kl_prior"] = self.prior_KL(None, pred["param"]) * linear_warmup(self.current_epoch, self.hparams.kl_weight_prior, 0, 20)
+        comps["kl_post"] = self.post_KL(None, pred["param"]) * linear_warmup(self.current_epoch, self.hparams.kl_weight_post, 5, 25)
+
+        total = torch.stack([v for v in comps.values()]).sum()
+        
+        for name, val in comps.items():
+            self.log(f"{stage}/loss/{name}", val, on_step=False, on_epoch=True, sync_dist=True)
+
         self.log(
             f"{stage}/loss_total", total,
-            prog_bar=True, on_step=False, on_epoch=True, sync_dist=True
+            on_step=False, on_epoch=True, sync_dist=True
         )
-
+        
         return {"loss": total}
 
     def training_step(self, batch, batch_idx):
-        return self._step(batch, stage="train")["loss"]
-
-    def validation_step(self, batch, batch_idx):
-        self._step(batch, stage="val")
-        
-        
+                
         # ----- collect a few pairs for visuals this epoch -----
         if ((self.current_epoch + 1) % self.log_images_every_n_epochs == 0
             and len(self._val_vis_pairs) < self.vis_num_pairs):
@@ -301,8 +285,12 @@ class DamLightning(LightningModule):
             with torch.no_grad():
                 self._collect_pairs(inputs, y_true, y_pred) 
         
+        return self._step(batch, stage="train")["loss"]
 
-    def on_validation_epoch_end(self):
+    def validation_step(self, batch, batch_idx):
+        self._step(batch, stage="val")
+
+    def on_train_epoch_end(self):
         # push panels if this is a logging epoch
         if (self.current_epoch + 1) % self.log_images_every_n_epochs == 0:
             self._log_pairs_to_wandb()
@@ -310,9 +298,7 @@ class DamLightning(LightningModule):
             # clear any leftover if we decided not to log this epoch
             self._val_vis_pairs.clear()
 
-
     # ------------------------------ Optimizer --------------------------------
-
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
 
