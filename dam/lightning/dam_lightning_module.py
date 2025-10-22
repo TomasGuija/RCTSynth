@@ -4,6 +4,7 @@ from lightning.pytorch import LightningModule
 import wandb
 from lightning.pytorch.loggers import WandbLogger
 import matplotlib.pyplot as plt
+import numpy as np
 
 from .. import src as dam
 
@@ -118,23 +119,56 @@ class DamLightning(LightningModule):
         if wb is None:
             self._val_vis_pairs.clear()
             return
+        
+        def _to01(x: torch.Tensor) -> np.ndarray:
+            """min-max to [0,1] for display."""
+            x = x.numpy()
+            mn, mx = x.min(), x.max()
+            return (x - mn) / (mx - mn + 1e-8)
+
+        def _psnr(gt01: np.ndarray, rc01: np.ndarray) -> float:
+            mse = np.mean((gt01 - rc01) ** 2)
+            return float(10.0 * np.log10(1.0 / (mse + 1e-12)))
+
+        def _ncc(gt01: np.ndarray, rc01: np.ndarray) -> float:
+            g = gt01 - gt01.mean()
+            r = rc01 - rc01.mean()
+            denom = np.sqrt((g**2).sum() * (r**2).sum()) + 1e-12
+            return float((g * r).sum() / denom)
 
         panels = []
         for idx, (pl, gt, rc) in enumerate(self._val_vis_pairs):
-            # side-by-side concat along width: [X, 2Y]
-            fig, axs = plt.subplots(1, 3, figsize=(9, 3), constrained_layout=True)
-            axs[0].imshow(pl.numpy(), cmap="gray")
-            axs[0].set_title("Planning", fontsize=10)
-            axs[0].axis("off")
-            axs[1].imshow(gt.numpy(), cmap="gray")
-            axs[1].set_title("GT Repeat", fontsize=10)
-            axs[1].axis("off")
-            axs[2].imshow(rc.numpy(), cmap="gray")
-            axs[2].set_title("Recon Repeat", fontsize=10)
-            axs[2].axis("off")
+            # Normalize each image to [0,1] for fair visual comparison
+            gt01 = _to01(gt)
+            rc01 = _to01(rc)
+
+            # Build overlay: GT->G channel, Recon->R+B (magenta)
+            overlay = np.stack([rc01, gt01, rc01], axis=-1)  # H×W×3
+
+            # Diff heatmap (absolute error)
+            diff = np.abs(gt01 - rc01)
+
+            # Metrics
+            mse  = float(np.mean((gt01 - rc01)**2))
+            psnr = _psnr(gt01, rc01)
+            ncc  = _ncc(gt01, rc01)
+
+            fig, axs = plt.subplots(1, 5, figsize=(15, 3), constrained_layout=True)
+            axs[0].imshow(pl.numpy(), cmap="gray"); axs[0].set_title("Planning", fontsize=10); axs[0].axis("off")
+            axs[1].imshow(gt.numpy(), cmap="gray"); axs[1].set_title("GT Repeat", fontsize=10); axs[1].axis("off")
+            axs[2].imshow(rc.numpy(), cmap="gray"); axs[2].set_title("Recon Repeat", fontsize=10); axs[2].axis("off")
+
+            axs[3].imshow(overlay); axs[3].set_title("Overlay (G=GT, M=Recon)", fontsize=10); axs[3].axis("off")
+
+            im = axs[4].imshow(diff, cmap="magma")
+            axs[4].set_title(f"Diff |GT−Recon|\nMSE={mse:.4f}  PSNR={psnr:.2f}  NCC={ncc:.3f}", fontsize=9)
+            axs[4].axis("off")
+            # optional tiny colorbar
+            plt.colorbar(im, ax=axs[4], fraction=0.046, pad=0.04)
+
             panels.append(wandb.Image(fig, caption=f"pair {idx}"))
             plt.close(fig)
-            
+
         wb.experiment.log({ "val/examples_gt_vs_recon": panels, "epoch": self.current_epoch })
         self._val_vis_pairs.clear()
     # -------------------------- Lightning lifecycle --------------------------
