@@ -4,7 +4,6 @@ trainer:
   accelerator: auto       # "gpu" to force
   devices: auto
   log_every_n_steps: 50
-  check_val_every_n_epoch: 50
   overfit_batches: 1
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
@@ -38,29 +37,28 @@ data:
   xmask: masks_planning
   ymask: masks_repeated
   train_split: 0.9
-  batch_size: 2
+  batch_size: 4
   num_workers: 0
   shuffle: false
-  maxv: 3000.0
-  minv: -1000.0
+  maxv: 1.0
+  minv: 0.0
 
 # DamLightning init args
 model:
-  lr: 1.0e-5
+  lr: 1.0e-3
   image_loss: ncc          # or "mse"
-  lambda_img: 5000.0
-  kappa: 1000.0
-  beta: 1
-  kl_weight_prior: 0.1
-  kl_weight_post: 0.00
+  lambda_img: 5.0
+  kappa: 1.0
+  beta: 0.00
+  kl_weight: 0.05
   bidir: false
-  latent_dim: 8
+  latent_dim: 32
   enc_nf: [16, 32, 32, 32]
   dec_nf: [32, 32, 32, 16]
   int_steps: 7
-  int_downsize: 1
+  int_downsize: 2
   conv_per_level: 1
-  # prior: false
+  prior: normal
   num_organs: 1
   cudnn_nondet: false
 
