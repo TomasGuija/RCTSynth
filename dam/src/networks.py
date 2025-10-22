@@ -102,7 +102,7 @@ class Encoder(nn.Module):
         stdev = torch.exp(0.5 * logvar)
         epsilon = torch.randn_like(stdev)
         latents = epsilon * stdev + mu
-        return latents, mu, stdev
+        return latents, mu, logvar
 
     def forward(self, x):
 

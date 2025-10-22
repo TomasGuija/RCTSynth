@@ -3,6 +3,7 @@ import torch
 from lightning.pytorch import LightningModule
 import wandb
 from lightning.pytorch.loggers import WandbLogger
+import matplotlib.pyplot as plt
 
 from .. import src as dam
 
@@ -69,13 +70,13 @@ class DamLightning(LightningModule):
 
         if self.vis_slice_mode == "mip":
             # max-intensity projection along Z
-            img = volc.max(dim=-1).values  # [B, X, Y]
+            img = volc.max(dim=-3).values  # [B, X, Y]
         else:
             # mid or index
-            Z = volc.shape[-1]
+            Z = volc.shape[-3]
             z = Z // 2 if (self.vis_slice_mode == "mid" or self.vis_slice_index is None) else int(self.vis_slice_index)
             z = max(0, min(Z - 1, z))
-            img = volc[..., z]  # [B, X, Y]
+            img = volc[:, z]  # [B, X, Y]
         return img
     
     def _normalize01(self, img: torch.Tensor) -> torch.Tensor:
@@ -94,16 +95,16 @@ class DamLightning(LightningModule):
         """
         # pick the recon tensor
         recon = y_pred[0] if isinstance(y_pred, (list, tuple)) else y_pred  # <-- pick recon tensor
-
+        
+        plan2d = self._normalize01(self._pick_slice(inputs)).detach().cpu()
         gt2d = self._normalize01(self._pick_slice(y_true)).detach().cpu()
         rc2d = self._normalize01(self._pick_slice(recon)).detach().cpu()
 
-        # how many more do we need?
-        remaining = self.vis_num_pairs - len(self._val_vis_pairs)
-        take = max(0, min(remaining, gt2d.shape[0]))
+        # how many more do we need? 
+        take = max(0, min(self.vis_num_pairs, gt2d.shape[0]))
         for i in range(take):
             # each item is (GT, Recon) as [X, Y] tensors
-            self._val_vis_pairs.append((gt2d[i], rc2d[i]))
+            self._val_vis_pairs.append((plan2d[i], gt2d[i], rc2d[i]))
 
     def _log_pairs_to_wandb(self):
         if not self.trainer.is_global_zero or len(self._val_vis_pairs) == 0:
@@ -119,11 +120,21 @@ class DamLightning(LightningModule):
             return
 
         panels = []
-        for idx, (gt, rc) in enumerate(self._val_vis_pairs):
+        for idx, (pl, gt, rc) in enumerate(self._val_vis_pairs):
             # side-by-side concat along width: [X, 2Y]
-            concat = torch.cat([gt, rc], dim=1)  # (X,Y) cat width -> dim=1
-            panels.append(wandb.Image(concat.numpy(), caption=f"pair {idx}: GT | Recon"))
-
+            fig, axs = plt.subplots(1, 3, figsize=(9, 3), constrained_layout=True)
+            axs[0].imshow(pl.numpy(), cmap="gray")
+            axs[0].set_title("Planning", fontsize=10)
+            axs[0].axis("off")
+            axs[1].imshow(gt.numpy(), cmap="gray")
+            axs[1].set_title("GT Repeat", fontsize=10)
+            axs[1].axis("off")
+            axs[2].imshow(rc.numpy(), cmap="gray")
+            axs[2].set_title("Recon Repeat", fontsize=10)
+            axs[2].axis("off")
+            panels.append(wandb.Image(fig, caption=f"pair {idx}"))
+            plt.close(fig)
+            
         wb.experiment.log({ "val/examples_gt_vs_recon": panels, "epoch": self.current_epoch })
         self._val_vis_pairs.clear()
     # -------------------------- Lightning lifecycle --------------------------
@@ -239,20 +250,23 @@ class DamLightning(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         self._step(batch, stage="val")
-
-        inputs, y_true, pmasks, rmasks = batch
-        inputs = inputs.float().permute(0, 4, 1, 2, 3)
-        y_true = y_true.float().permute(0, 4, 1, 2, 3)
-        pmasks = pmasks.to(torch.int64).permute(0, 4, 1, 2, 3)
-        rmasks = rmasks.to(torch.int64).permute(0, 4, 1, 2, 3)
-
-        y_pred = self.model(inputs, y_true, pmasks, rmasks)
-
+        
+        
         # ----- collect a few pairs for visuals this epoch -----
         if ((self.current_epoch + 1) % self.log_images_every_n_epochs == 0
             and len(self._val_vis_pairs) < self.vis_num_pairs):
+            
+            inputs, y_true, pmasks, rmasks = batch
+            inputs = inputs.float().permute(0, 4, 1, 2, 3)
+            y_true = y_true.float().permute(0, 4, 1, 2, 3)
+            pmasks = pmasks.to(torch.int64).permute(0, 4, 1, 2, 3)
+            rmasks = rmasks.to(torch.int64).permute(0, 4, 1, 2, 3)
+
+            y_pred = self.model(inputs, y_true, pmasks, rmasks)
+
             with torch.no_grad():
-                self._collect_pairs(inputs, y_true, y_pred)
+                self._collect_pairs(inputs, y_true, y_pred) 
+        
 
     def on_validation_epoch_end(self):
         # push panels if this is a logging epoch
