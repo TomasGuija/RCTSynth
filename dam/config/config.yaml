@@ -36,11 +36,12 @@ data:
   xmask: masks_planning
   ymask: masks_repeated
   train_split: 0.95
-  batch_size: 16
+  batch_size: 8
   num_workers: 0
-  shuffle: true
+  shuffle: false
   maxv: 1.0
   minv: 0.0
+  enable_swapping: false
 
 # DamLightning init args
 model:
@@ -49,20 +50,19 @@ model:
   lambda_img: 1.0
   kappa: 1.0
   beta: 0.01
-  kl_weight: 1.0
+  kl_weight_prior: 1.0
+  kl_weight_post: 0.0
   bidir: false
   latent_dim: 32
   enc_nf: [16, 32, 32, 32]
   dec_nf: [32, 32, 32, 16]
   int_steps: 7
-  int_downsize: 2
+  int_downsize: 1
   conv_per_level: 1
-  prior: normal
   num_organs: 1
   cudnn_nondet: false
-
-  log_images_every_n_epochs: 50   # log visuals every N val epochs
-  vis_num_pairs: 5               # how many (GT, Recon) pairs to log each time
+  evaluate_every_n_epochs: 50   # log visuals every N val epochs
+  evaluate_num_pairs: 10               # how many (GT, Recon) pairs to log each time
   vis_slice_mode: mid            # mid | mip | index
   vis_slice_index: null          # if mode=index, choose the Z slice (int)
   vis_channel: 0                 # which input/target channel to display

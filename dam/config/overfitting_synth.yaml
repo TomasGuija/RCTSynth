@@ -61,9 +61,8 @@ model:
   prior: normal
   num_organs: 1
   cudnn_nondet: false
-
-  log_images_every_n_epochs: 25   # log visuals every N val epochs
-  vis_num_pairs: 5               # how many (GT, Recon) pairs to log each time
+  evaluate_every_n_epochs: 50   # log visuals every N val epochs
+  evaluate_num_pairs: 10               # how many (GT, Recon) pairs to log each time
   vis_slice_mode: index            # mid | mip | index
   vis_slice_index: 8          # if mode=index, choose the Z slice (int)
   vis_channel: 0                 # which input/target channel to display
