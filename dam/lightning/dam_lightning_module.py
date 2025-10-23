@@ -8,6 +8,7 @@ import numpy as np
 
 from .. import src as dam
 from ..src.metrics import grad_mae_3d
+from ..utils.elastix import elastix_register_and_resample
 
 
 class DamLightning(LightningModule):
@@ -63,6 +64,10 @@ class DamLightning(LightningModule):
         self.register_buffer("_train_gradmae_count", torch.tensor(0.0))
         self.register_buffer("_val_gradmae_sum", torch.tensor(0.0))
         self.register_buffer("_val_gradmae_count", torch.tensor(0.0))
+        self.register_buffer("_train_vs_elx_ncc_sum",   torch.tensor(0.0))
+        self.register_buffer("_train_vs_elx_ncc_count", torch.tensor(0.0))
+        self.register_buffer("_val_vs_elx_ncc_sum",     torch.tensor(0.0))
+        self.register_buffer("_val_vs_elx_ncc_count",   torch.tensor(0.0))
 
         # How many example pairs we’ve logged in the current eval epoch
         self.register_buffer("_eval_pairs_logged", torch.tensor(0.0))
@@ -116,6 +121,12 @@ class DamLightning(LightningModule):
     def _to01_np(x: np.ndarray) -> np.ndarray:
         mn, mx = x.min(), x.max()
         return (x - mn) / (mx - mn + 1e-8)
+    
+    @staticmethod
+    def _to01_t(x: torch.Tensor) -> torch.Tensor:
+        mn = x.amin()
+        mx = x.amax()
+        return (x - mn) / (mx - mn + 1e-8)
 
     @staticmethod
     def _psnr01(gt01: np.ndarray, rc01: np.ndarray) -> float:
@@ -127,6 +138,14 @@ class DamLightning(LightningModule):
         g = gt01 - gt01.mean()
         r = rc01 - rc01.mean()
         denom = np.sqrt((g ** 2).sum() * (r ** 2).sum()) + 1e-12
+        return float((g * r).sum() / denom)
+    
+    @staticmethod
+    def _ncc_t(gt: torch.Tensor, rc: torch.Tensor) -> float:
+        """NCC over full 3D tensor (any shape), returns float."""
+        g = gt - gt.mean()
+        r = rc - rc.mean()
+        denom = (g.square().sum().sqrt() * r.square().sum().sqrt()) + 1e-12
         return float((g * r).sum() / denom)
 
     def _pick_slice(self, vol: torch.Tensor) -> torch.Tensor:
@@ -173,6 +192,33 @@ class DamLightning(LightningModule):
             return {"rep": rep, "mrep": mrep, "svf": svf, "param": param}
 
     # -------------------------- Visuals & metric panels --------------------------
+    def _eval_elastix_vs_model(
+        self, planning_3d: torch.Tensor, gt_3d: torch.Tensor
+    ) -> dict:
+        """
+        planning_3d, gt_3d: [X, Y, Z] torch tensors on CPU.
+        Returns dict with Elastix metrics
+        """
+        pl_np = planning_3d.numpy()
+        gt_np = gt_3d.numpy()
+
+        # 1) Elastix recon (planning -> fixed=GT)
+        elx_rc_np = elastix_register_and_resample(pl_np, gt_np)  # [X,Y,Z] np.float64
+        elx_rc = torch.from_numpy(elx_rc_np)
+
+        # 2) Compute image metrics
+        def to01_t(x: torch.Tensor) -> torch.Tensor:
+            mn, mx = x.amin(), x.amax()
+            return (x - mn) / (mx - mn + 1e-8)
+
+        gt01  = to01_t(gt_3d)
+        elx01 = to01_t(elx_rc)
+
+        g  = (gt01 - gt01.mean())
+        e  = (elx01 - elx01.mean())
+        ncc_elx = float((g*e).sum() / (g.square().sum().sqrt() * e.square().sum().sqrt() + 1e-12))
+
+        return dict(ncc_elx=ncc_elx, elx_rc=elx_rc)
 
     def _build_pair_panel(self, planning2d: torch.Tensor, gt2d: torch.Tensor, rc2d: torch.Tensor) -> tuple[wandb.Image, Dict[str, float]]:
         """
@@ -235,7 +281,7 @@ class DamLightning(LightningModule):
 
         recon = pred["rep"][:k]                  # [k,1,X,Y,Z]
         yt_k  = y_true[:k]                       # [k,1,X,Y,Z]
-        in_k  = inputs[:k]                       # [k,C,X,Y,Z] (we’ll pick channel inside)
+        in_k  = inputs[:k]                       # [k,C,X,Y,Z]
 
         # Compute and accumulate grad-MAE on these k samples (mean across those k)
         gmae = grad_mae_3d(yt_k, recon)          # scalar
@@ -250,6 +296,34 @@ class DamLightning(LightningModule):
         # Build panels
         panels = []
         for i in range(k):
+            
+            # Elastix registration. Commented out for speed; enable if desired.
+            """
+            c = self.vis_channel
+            planning3d = in_k[i, c].detach().cpu()
+            gt3d       = yt_k[i, 0].detach().cpu()
+            model3d    = recon[i, 0].detach().cpu()
+
+            elx_np = elastix_register_and_resample(planning3d.numpy(), gt3d.numpy())
+            elx3d  = torch.from_numpy(elx_np)
+
+            gt01    = self._to01_t(gt3d)
+            m01     = self._to01_t(model3d)
+            e01     = self._to01_t(elx3d)
+
+            ncc_m   = self._ncc_t(gt01, m01)
+            ncc_e   = self._ncc_t(gt01, e01)
+            delta_ncc = ncc_m - ncc_e  
+            
+
+            if accum_key_prefix == "train":
+                self._train_vs_elx_ncc_sum   += torch.tensor(delta_ncc, device=self._train_vs_elx_ncc_sum.device)
+                self._train_vs_elx_ncc_count += torch.tensor(1.0,       device=self._train_vs_elx_ncc_count.device)
+            else:
+                self._val_vs_elx_ncc_sum   += torch.tensor(delta_ncc, device=self._val_vs_elx_ncc_sum.device)
+                self._val_vs_elx_ncc_count += torch.tensor(1.0,       device=self._val_vs_elx_ncc_count.device)
+            """
+            
             pl2d = self._normalize01(self._pick_slice(in_k[i:i+1]))[0].detach().cpu()
             gt2d = self._normalize01(self._pick_slice(yt_k[i:i+1]))[0].detach().cpu()
             rc2d = self._normalize01(self._pick_slice(recon[i:i+1]))[0].detach().cpu()
@@ -312,7 +386,7 @@ class DamLightning(LightningModule):
         out = self._step(batch, stage="train")
 
         # gated example logging on train
-        do_eval_epoch = (self.current_epoch % self.evaluate_every_n_epochs == 0)
+        do_eval_epoch = ((self.current_epoch + 1) % self.evaluate_every_n_epochs == 0)
         remain = int(self.evaluate_num_pairs - self._eval_pairs_logged.item())
         if do_eval_epoch and remain > 0:
             self._maybe_log_examples(
@@ -336,7 +410,12 @@ class DamLightning(LightningModule):
             if self._train_gradmae_count.item() > 0:
                 gmae_mean = self._train_gradmae_sum / self._train_gradmae_count.clamp_min(1.0)
                 self.log("train/grad_mae3d", gmae_mean, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            if self._train_vs_elx_ncc_count.item() > 0:
+                mean_delta_ncc = self._train_vs_elx_ncc_sum / self._train_vs_elx_ncc_count.clamp_min(1.0)
+                self.log("train/vs_elastix/delta_ncc_mean", mean_delta_ncc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
             # reset for next eval window
+            self._train_vs_elx_ncc_sum.zero_()
+            self._train_vs_elx_ncc_count.zero_()
             self._train_gradmae_sum.zero_()
             self._train_gradmae_count.zero_()
             self._eval_pairs_logged.zero_()
@@ -345,7 +424,7 @@ class DamLightning(LightningModule):
         out = self._step(batch, stage="val")
 
         # gated example logging on val (independent of train gating)
-        do_eval_epoch = (self.current_epoch % self.evaluate_every_n_epochs == 0)
+        do_eval_epoch = ((self.current_epoch + 1) % self.evaluate_every_n_epochs == 0)
         self._maybe_log_examples(
             stage="val",
             inputs=out["inputs"],
@@ -359,11 +438,16 @@ class DamLightning(LightningModule):
     def on_validation_epoch_end(self):
         # Log aggregated grad-MAE for val if we recorded any, then reset
         if (self.current_epoch + 1) % self.evaluate_every_n_epochs == 0:
+            if self._val_vs_elx_ncc_count.item() > 0:
+                mean_delta_ncc = self._val_vs_elx_ncc_sum / self._val_vs_elx_ncc_count.clamp_min(1.0)
+                self.log("val/vs_elastix/delta_ncc_mean", mean_delta_ncc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
             if self._val_gradmae_count.item() > 0:
                 gmae_mean = self._val_gradmae_sum / self._val_gradmae_count.clamp_min(1.0)
                 self.log("val/grad_mae3d", gmae_mean, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
             self._val_gradmae_sum.zero_()
             self._val_gradmae_count.zero_()
+            self._val_vs_elx_ncc_sum.zero_()
+            self._val_vs_elx_ncc_count.zero_()
 
     # ------------------------------ Optimizer --------------------------------
 
