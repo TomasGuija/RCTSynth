@@ -200,9 +200,9 @@ class DamLightning(LightningModule):
             )
 
         if self._image_loss_name == "ncc":
-            self.img_loss = dam.losses.NCC(device=self.device).loss
+            self.img_loss = dam.losses.NCC(device=self.device, use_weights=True).loss
         elif self._image_loss_name == "mse":
-            self.img_loss = dam.losses.MSE().loss
+            self.img_loss = dam.losses.MSE(use_weights=True).loss
         else:
             raise ValueError(f"Invalid image_loss: {self._image_loss_name}")
 
