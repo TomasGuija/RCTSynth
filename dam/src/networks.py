@@ -304,7 +304,7 @@ class DamBase(LoadableModel):
                  unet_feat_mult=1,
                  nb_unet_conv_per_level=1,
                  int_steps=7,
-                 int_downsize=2,
+                 int_downsize=1,
                  bidir=False,
                  src_feats=2,
                  trg_feats=2,
