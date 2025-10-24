@@ -6,10 +6,9 @@ from lightning.pytorch.loggers import WandbLogger
 import wandb
 import matplotlib.pyplot as plt
 import numpy as np
+import inspect
 
 from .. import src as dam
-from ..src.metrics import grad_mae_3d
-from ..utils.elastix import elastix_register_and_resample
 
 
 class DamLightning(LightningModule):
@@ -40,7 +39,12 @@ class DamLightning(LightningModule):
         vis_normalize_per_image: bool = True,
     ):
         super().__init__()
-        self.save_hyperparameters()
+
+        sig = inspect.signature(self.__init__)
+        allowed = {name for name, p in sig.parameters.items() if name != "self"}
+        hp = {k: v for k, v in locals().items()
+              if k in allowed and not k.startswith("_")}
+        self.save_hyperparameters(hp)
 
         # Core settings
         self.model = None
@@ -60,34 +64,24 @@ class DamLightning(LightningModule):
         self.vis_channel = int(vis_channel)
         self.vis_normalize_per_image = bool(vis_normalize_per_image)
 
-        # Stage-specific accumulators (device-safe)
-        self.register_buffer("_train_gradmae_sum", torch.tensor(0.0))
-        self.register_buffer("_train_gradmae_count", torch.tensor(0.0))
-        self.register_buffer("_val_gradmae_sum", torch.tensor(0.0))
-        self.register_buffer("_val_gradmae_count", torch.tensor(0.0))
-        self.register_buffer("_train_vs_elx_ncc_sum",   torch.tensor(0.0))
-        self.register_buffer("_train_vs_elx_ncc_count", torch.tensor(0.0))
-        self.register_buffer("_val_vs_elx_ncc_sum",     torch.tensor(0.0))
-        self.register_buffer("_val_vs_elx_ncc_count",   torch.tensor(0.0))
-
         # How many example pairs we’ve logged in the current eval epoch
         self.register_buffer("_eval_pairs_logged", torch.tensor(0.0))
 
     # -------------------------- Setup & losses --------------------------
+    def build_model(self, inshape):
+        self.model = dam.networks.DamBase(
+            inshape=inshape,
+            latent_dim=self.hparams.latent_dim,
+            nb_unet_features=[self.hparams.enc_nf, self.hparams.dec_nf],
+            int_steps=self.hparams.int_steps,
+            int_downsize=self.hparams.int_downsize,
+            nb_unet_conv_per_level=self.hparams.conv_per_level,
+            bidir=self.hparams.bidir,
+        )
 
     def setup(self, stage: Any = None):
-        self.hparams.inshape = self.trainer.datamodule.inshape  # (X, Y, Z)
-
         if self.model is None:
-            self.model = dam.networks.DamBase(
-                inshape=self.hparams.inshape,
-                latent_dim=self.hparams.latent_dim,
-                nb_unet_features=[self.hparams.enc_nf, self.hparams.dec_nf],
-                int_steps=self.hparams.int_steps,
-                int_downsize=self.hparams.int_downsize,
-                nb_unet_conv_per_level=self.hparams.conv_per_level,
-                bidir=self.hparams.bidir,
-            )
+            self.build_model(self.trainer.datamodule.inshape)
 
         if self._image_loss_name == "ncc":
             self.img_loss = dam.losses.NCC(device=self.device, use_weights=True).loss
@@ -193,34 +187,6 @@ class DamLightning(LightningModule):
             return {"rep": rep, "mrep": mrep, "svf": svf, "param": param}
 
     # -------------------------- Visuals & metric panels --------------------------
-    def _eval_elastix_vs_model(
-        self, planning_3d: torch.Tensor, gt_3d: torch.Tensor
-    ) -> dict:
-        """
-        planning_3d, gt_3d: [X, Y, Z] torch tensors on CPU.
-        Returns dict with Elastix metrics
-        """
-        pl_np = planning_3d.numpy()
-        gt_np = gt_3d.numpy()
-
-        # 1) Elastix recon (planning -> fixed=GT)
-        elx_rc_np = elastix_register_and_resample(pl_np, gt_np)  # [X,Y,Z] np.float64
-        elx_rc = torch.from_numpy(elx_rc_np)
-
-        # 2) Compute image metrics
-        def to01_t(x: torch.Tensor) -> torch.Tensor:
-            mn, mx = x.amin(), x.amax()
-            return (x - mn) / (mx - mn + 1e-8)
-
-        gt01  = to01_t(gt_3d)
-        elx01 = to01_t(elx_rc)
-
-        g  = (gt01 - gt01.mean())
-        e  = (elx01 - elx01.mean())
-        ncc_elx = float((g*e).sum() / (g.square().sum().sqrt() * e.square().sum().sqrt() + 1e-12))
-
-        return dict(ncc_elx=ncc_elx, elx_rc=elx_rc)
-
     def _build_pair_panel(self, planning2d: torch.Tensor, gt2d: torch.Tensor, rc2d: torch.Tensor) -> tuple[wandb.Image, Dict[str, float]]:
         """
         Build a 5-panel figure (planning, GT, recon, overlay, |diff|) and return
@@ -263,7 +229,6 @@ class DamLightning(LightningModule):
         pred: Dict[str, torch.Tensor],            # outputs dict
         limit: int,
         eval_gate: bool,                          # whether this epoch is an eval-logging epoch
-        accum_key_prefix: str,                    # e.g., "train" or "val" for accumulators
     ) -> None:
         """
         Optionally log example panels + grad-MAE, and accumulate stage metrics.
@@ -284,47 +249,9 @@ class DamLightning(LightningModule):
         yt_k  = y_true[:k]                       # [k,1,X,Y,Z]
         in_k  = inputs[:k]                       # [k,C,X,Y,Z]
 
-        # Compute and accumulate grad-MAE on these k samples (mean across those k)
-        gmae = grad_mae_3d(yt_k, recon)          # scalar
-        k_tensor = torch.tensor(float(k), device=gmae.device)
-        if accum_key_prefix == "train":
-            self._train_gradmae_sum   += gmae * k_tensor
-            self._train_gradmae_count += k_tensor
-        else:
-            self._val_gradmae_sum   += gmae * k_tensor
-            self._val_gradmae_count += k_tensor
-
         # Build panels
         panels = []
-        for i in range(k):
-            
-            # Elastix registration. Commented out for speed; enable if desired.
-            """
-            c = self.vis_channel
-            planning3d = in_k[i, c].detach().cpu()
-            gt3d       = yt_k[i, 0].detach().cpu()
-            model3d    = recon[i, 0].detach().cpu()
-
-            elx_np = elastix_register_and_resample(planning3d.numpy(), gt3d.numpy())
-            elx3d  = torch.from_numpy(elx_np)
-
-            gt01    = self._to01_t(gt3d)
-            m01     = self._to01_t(model3d)
-            e01     = self._to01_t(elx3d)
-
-            ncc_m   = self._ncc_t(gt01, m01)
-            ncc_e   = self._ncc_t(gt01, e01)
-            delta_ncc = ncc_m - ncc_e  
-            
-
-            if accum_key_prefix == "train":
-                self._train_vs_elx_ncc_sum   += torch.tensor(delta_ncc, device=self._train_vs_elx_ncc_sum.device)
-                self._train_vs_elx_ncc_count += torch.tensor(1.0,       device=self._train_vs_elx_ncc_count.device)
-            else:
-                self._val_vs_elx_ncc_sum   += torch.tensor(delta_ncc, device=self._val_vs_elx_ncc_sum.device)
-                self._val_vs_elx_ncc_count += torch.tensor(1.0,       device=self._val_vs_elx_ncc_count.device)
-            """
-            
+        for i in range(k):        
             pl2d = self._normalize01(self._pick_slice(in_k[i:i+1]))[0].detach().cpu()
             gt2d = self._normalize01(self._pick_slice(yt_k[i:i+1]))[0].detach().cpu()
             rc2d = self._normalize01(self._pick_slice(recon[i:i+1]))[0].detach().cpu()
@@ -397,7 +324,6 @@ class DamLightning(LightningModule):
                 pred=out["pred"],
                 limit=remain,
                 eval_gate=True,
-                accum_key_prefix="train",
             )
             # advance pair counter
             k_used = min(remain, out["y_true"].size(0))
@@ -406,19 +332,7 @@ class DamLightning(LightningModule):
         return out["loss"]
 
     def on_train_epoch_end(self):
-        # At the end of an eval epoch for train: log aggregated grad-MAE, then reset
         if (self.current_epoch + 1) % self.evaluate_every_n_epochs == 0:
-            if self._train_gradmae_count.item() > 0:
-                gmae_mean = self._train_gradmae_sum / self._train_gradmae_count.clamp_min(1.0)
-                self.log("train/grad_mae3d", gmae_mean, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-            if self._train_vs_elx_ncc_count.item() > 0:
-                mean_delta_ncc = self._train_vs_elx_ncc_sum / self._train_vs_elx_ncc_count.clamp_min(1.0)
-                self.log("train/vs_elastix/delta_ncc_mean", mean_delta_ncc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-            # reset for next eval window
-            self._train_vs_elx_ncc_sum.zero_()
-            self._train_vs_elx_ncc_count.zero_()
-            self._train_gradmae_sum.zero_()
-            self._train_gradmae_count.zero_()
             self._eval_pairs_logged.zero_()
 
     def validation_step(self, batch, batch_idx):
@@ -433,21 +347,10 @@ class DamLightning(LightningModule):
             pred=out["pred"],
             limit=self.evaluate_num_pairs,
             eval_gate=do_eval_epoch,
-            accum_key_prefix="val",
         )
 
     def on_validation_epoch_end(self):
-        # Log aggregated grad-MAE for val if we recorded any, then reset
         if (self.current_epoch + 1) % self.evaluate_every_n_epochs == 0:
-            if self._val_vs_elx_ncc_count.item() > 0:
-                mean_delta_ncc = self._val_vs_elx_ncc_sum / self._val_vs_elx_ncc_count.clamp_min(1.0)
-                self.log("val/vs_elastix/delta_ncc_mean", mean_delta_ncc, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-            if self._val_gradmae_count.item() > 0:
-                gmae_mean = self._val_gradmae_sum / self._val_gradmae_count.clamp_min(1.0)
-                self.log("val/grad_mae3d", gmae_mean, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-            self._val_gradmae_sum.zero_()
-            self._val_gradmae_count.zero_()
-            self._val_vs_elx_ncc_sum.zero_()
             self._val_vs_elx_ncc_count.zero_()
 
     # ------------------------------ Optimizer --------------------------------
