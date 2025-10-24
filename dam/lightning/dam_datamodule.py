@@ -21,6 +21,9 @@ class H5VolumesDataset(Dataset):
         ykey: str,
         xmask: str,
         ymask: str,
+        # New anatomy masks
+        xamask: str = None,
+        yamask: str = None,
         maxv: float,
         minv: float,
         enable_swapping: bool = False,
@@ -40,6 +43,8 @@ class H5VolumesDataset(Dataset):
             ykey=ykey,
             xmask=xmask,
             ymask=ymask,
+            xamask=xamask,
+            yamask=yamask,
             maxv=maxv,
             minv=minv,
         )
@@ -58,6 +63,9 @@ class H5VolumesDataset(Dataset):
             if len(item) == 4:
                 x, y, xm, ym = item
                 return y, x, ym, xm
+            elif len(item) == 6:
+                x, y, xm, ym, xam, yam = item
+                return y, x, ym, xm, yam, xam
             else:
                 x, y = item
                 return y, x
@@ -81,6 +89,9 @@ class DamDataModule(LightningDataModule):
         ykey: str,
         xmask: str,
         ymask: str,
+        # New anatomy masks
+        xamask: str,
+        yamask: str,
         maxv: float,
         minv: float,
         train_split: float,
@@ -95,6 +106,8 @@ class DamDataModule(LightningDataModule):
         self.ykey = ykey
         self.xmask = xmask
         self.ymask = ymask
+        self.xamask = xamask
+        self.yamask = yamask
         self.maxv = maxv
         self.minv = minv
         self.train_split = train_split
@@ -126,6 +139,8 @@ class DamDataModule(LightningDataModule):
             ykey=self.ykey,
             xmask=self.xmask,
             ymask=self.ymask,
+            xamask=self.xamask,
+            yamask=self.yamask,
             maxv=self.maxv,
             minv=self.minv,
             enable_swapping=self.enable_swapping,
@@ -138,6 +153,8 @@ class DamDataModule(LightningDataModule):
             ykey=self.ykey,
             xmask=self.xmask,
             ymask=self.ymask,
+            xamask=self.xamask,
+            yamask=self.yamask,
             maxv=self.maxv,
             minv=self.minv,
             enable_swapping=False,

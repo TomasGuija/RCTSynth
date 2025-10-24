@@ -57,6 +57,8 @@ def evaluate(
         ykey="repeated",
         xmask="masks_planning",
         ymask="masks_repeated",
+        xamask="planning_anatomy_mask",
+        yamask="repeated_anatomy_mask",
         maxv=1.0,
         minv=0.0,
         train_split=0.95,

@@ -3,6 +3,8 @@ import time
 import h5py
 import nibabel as nib
 import numpy as np
+import scipy.ndimage as ndi
+
 from tqdm.auto import tqdm
 from scipy.ndimage import zoom
 
@@ -57,6 +59,49 @@ def _prep_mask(vol, target_shape, method="resize"):
         return out.astype(np.uint8, copy=False)
     return out.astype(np.int16, copy=False)
 
+def _make_anatomy_mask(vol, hu_thresh=-500, dilate_vox: int = 2):
+    """
+    Build an anatomy mask from CT volume:
+      - Threshold at hu_thresh
+      - Keep largest connected component (removes table/artifacts)
+      - Fill holes
+      - Dilate by N voxels to include margin around anatomy
+
+    Parameters:
+      vol: 3D numpy array (HU)
+      hu_thresh: threshold for anatomy (HU > hu_thresh -> inside)
+      dilate_vox: number of voxels to dilate mask (0 for no dilation)
+    """
+    # Hard threshold
+    mask = vol > hu_thresh
+
+    # NOTE: I'm not really sure if this is necessary. 
+    # Keep largest connected component
+    labels, nlabels = ndi.label(mask)
+    if nlabels > 0:
+        counts = np.bincount(labels.ravel())
+        counts[0] = 0  # ignore background
+        if counts.size > 1 and counts.max() > 0:
+            largest_label = counts.argmax()
+            mask = (labels == largest_label)
+        else:
+            mask = (labels > 0)
+
+    # Fill holes in the component
+    mask_filled = ndi.binary_fill_holes(mask)
+
+    # Dilate if requested
+    if dilate_vox > 0:
+        struct = ndi.generate_binary_structure(3, 1)  # 6-connectivity
+        mask_dilated = ndi.binary_dilation(
+            mask_filled, 
+            structure=struct,
+            iterations=dilate_vox
+        )
+        return mask_dilated.astype(np.uint8)
+    
+    return mask_filled.astype(np.uint8)
+
 def convert_nifti_to_hdf5(
     planning_dir, repeated_dir, mask_planning_dir, mask_repeated_dir, output_file,
     target_shape=(32, 32, 4), method="resize", dtype=np.float32,
@@ -103,6 +148,12 @@ def convert_nifti_to_hdf5(
             "masks_repeated": h5f.create_dataset("masks_repeated", shape=tuple(target_shape) + (n,),
                                                  dtype=np.int16, chunks=True, compression=compression,
                                                  compression_opts=compression_opts),
+            "planning_anatomy_mask":   h5f.create_dataset("planning_anatomy_mask",   shape=tuple(target_shape) + (n,),
+                                                 dtype=np.uint8, chunks=True, compression=compression,
+                                                 compression_opts=compression_opts),
+            "repeated_anatomy_mask":   h5f.create_dataset("repeated_anatomy_mask",   shape=tuple(target_shape) + (n,),
+                                                 dtype=np.uint8, chunks=True, compression=compression,
+                                                 compression_opts=compression_opts),
         }
 
         for i in tqdm(range(n), desc="Writing HDF5 (cropped/resized)", unit="vol"):
@@ -118,24 +169,31 @@ def convert_nifti_to_hdf5(
             mp_small = _prep_mask(mp,  target_shape, method)
             mr_small = _prep_mask(mr,  target_shape, method)
 
+            # Anatomy mask from repeated scan
+            r_anatomy_mask = _make_anatomy_mask(r_small)
+            p_anatomy_mask = _make_anatomy_mask(p_small)
+
             # Write
             dsets["planning"][..., i]       = p_small
             dsets["repeated"][..., i]       = r_small
             dsets["masks_planning"][..., i] = mp_small
             dsets["masks_repeated"][..., i] = mr_small
+            dsets["planning_anatomy_mask"][..., i]   = p_anatomy_mask
+            dsets["repeated_anatomy_mask"][..., i]   = r_anatomy_mask
+
 
     print(f"[DONE] {output_file}  ({time.strftime('%H:%M:%S', time.gmtime(time.time()-t0))})")
 
 if __name__ == "__main__":
     convert_nifti_to_hdf5(
-        planning_dir = "Z:/PROYECTOS_INVESTIGACION/2024-CPT-PatientModeling/002_DATASET/dataset_minifti/planning_CT",
-        repeated_dir = "Z:/PROYECTOS_INVESTIGACION/2024-CPT-PatientModeling/002_DATASET/dataset_minifti/repeated_CT",
-        mask_planning_dir = "Z:/PROYECTOS_INVESTIGACION/2024-CPT-PatientModeling/002_DATASET/dataset_minifti/masks_planning_CT",
-        mask_repeated_dir = "Z:/PROYECTOS_INVESTIGACION/2024-CPT-PatientModeling/002_DATASET/dataset_minifti/masks_repeated_CT",
-        output_file = "Z:/DOCTORADO/TGuija/RCTSynth/dam/data/mini.h5",
-        target_shape=(32, 32, 16),     # ← change here
+        planning_dir = "Z:/PROYECTOS_INVESTIGACION/2024-CPT-PatientModeling/002_DATASET/DAM/raw_dataset/planning",
+        repeated_dir = "Z:/PROYECTOS_INVESTIGACION/2024-CPT-PatientModeling/002_DATASET/DAM/raw_dataset/repeated",
+        mask_planning_dir = "Z:/PROYECTOS_INVESTIGACION/2024-CPT-PatientModeling/002_DATASET/DAM/raw_dataset/masks_planning",
+        mask_repeated_dir = "Z:/PROYECTOS_INVESTIGACION/2024-CPT-PatientModeling/002_DATASET/DAM/raw_dataset/masks_repeated",
+        output_file = "Z:/DOCTORADO/TGuija/RCTSynth/dam/data/mini_masked.h5",
+        target_shape=(32, 32, 16),
         method="resize",              # 'resize' or 'crop'
         compression="lzf",            # faster writes; use 'gzip' for smaller files
         compression_opts=None,
-        max_vols=16                   # limit number of cases for quick experiments
+        max_vols=24                   # limit number of cases for quick experiments
     )

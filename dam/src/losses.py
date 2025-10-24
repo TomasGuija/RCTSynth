@@ -4,75 +4,24 @@ import numpy as np
 import math
 
 
-def _per_sample_percentile_threshold(
-    x: torch.Tensor,          # (B,1,X,Y,Z)
-    p_air: float = 0.08,      # lowest p% treated as air
-) -> torch.Tensor:
-    assert x.dim() == 5 and x.size(1) == 1, "expected (B,1,X,Y,Z)"
-    B = x.shape[0]
-    flat = x.reshape(B, -1)
-
-    # clamp p_air and compute common k for all samples (same voxel count)
-    p = float(max(0.0, min(1.0, p_air)))
-    N = flat.size(1)
-    k = max(1, min(N, int(round(p * N))))  # 1..N
-
-    # kth *smallest* value per sample (vectorized)
-    # torch.kthvalue returns (values, indices)
-    thr_vals, _ = torch.kthvalue(flat, k=k, dim=1, keepdim=True)  # (B,1)
-    thr = thr_vals.view(B, 1, 1, 1, 1).to(dtype=x.dtype, device=x.device)
-
-    return thr
-
-#TODO: find a better way to do this, more robustly
-@torch.no_grad()
-def build_anatomy_weights(
-    ct_rep: torch.Tensor,   # (B,1,X[,Y[,Z]])
-    *,
-    p_air: float = 0.08,    # percentile to separate air/body
-) -> torch.Tensor:
-    """
-    Hard mask: 1 inside body (ct_rep > thr), 0 elsewhere.
-    """
-    thr = _per_sample_percentile_threshold(ct_rep, p_air=p_air)
-    M = (ct_rep > thr).float()
-    return M.clamp_min(1e-6)  # keep tiny >0 to avoid zero-mass issues if needed
-
-
 class NCC:
     """
     Local (over window) normalized cross correlation loss.
+    Optionally masked by a binary mask (1=anatomy, 0=background).
     """
-    def __init__(
-        self,
-        win=None,
-        device='cpu',
-        use_weights: bool = False,
-        # params forwarded to build_anatomy_weights when use_weights=True:
-        p_air: float = 0.08,
-    ):
+    def __init__(self, win=None, device='cpu'):
         self.win = win
         self.device = device
-        self.use_weights = use_weights
-        self._w_params = dict(
-            p_air=p_air,
-        )
 
-    def loss(self, y_true, y_pred, weight: torch.Tensor | None = None, eps: float = 1e-5):
-
+    def loss(self, y_true, y_pred, mask: torch.Tensor = None, eps: float = 1e-5):
         Ii = y_true
         Ji = y_pred
 
-        # get dimension of volume
         ndims = len(list(Ii.size())) - 2
         assert ndims in [1, 2, 3], "volumes should be 1 to 3 dimensions. found: %d" % ndims
 
-        # set window size
         win = [9] * ndims if self.win is None else self.win
-
-        # compute filters
         sum_filt = torch.ones([1, 1, *win]).to(self.device, dtype=Ii.dtype)
-
         pad_no = math.floor(win[0] / 2)
 
         if ndims == 1:
@@ -85,17 +34,38 @@ class NCC:
             stride = (1, 1, 1)
             padding = (pad_no, pad_no, pad_no)
 
-        # get convolution function
         conv_fn = getattr(F, 'conv%dd' % ndims)
 
-        # build weights if requested and not provided
-        if weight is None and self.use_weights:
-            W = build_anatomy_weights(Ii, **self._w_params).to(Ii.dtype)
-        else:
-            W = None if weight is None else weight.to(Ii.dtype)
+        if mask is not None:
+            # Convert mask to binary float (0/1)
+            W = torch.clamp(mask.to(Ii.dtype), 0, 1)
+            W_sum = conv_fn(W, sum_filt, stride=stride, padding=padding)
+            
+            # Only compute where mask is non-zero
+            I_sum  = conv_fn(Ii * W,          sum_filt, stride=stride, padding=padding)
+            J_sum  = conv_fn(Ji * W,          sum_filt, stride=stride, padding=padding)
+            I2_sum = conv_fn((Ii * Ii) * W,   sum_filt, stride=stride, padding=padding)
+            J2_sum = conv_fn((Ji * Ji) * W,   sum_filt, stride=stride, padding=padding)
+            IJ_sum = conv_fn((Ii * Ji) * W,   sum_filt, stride=stride, padding=padding)
+            
+            W_safe = W_sum.clamp_min(eps)
+            u_I = I_sum / W_safe
+            u_J = J_sum / W_safe
 
-        if W is None:
-            # compute CC squares
+            cross = IJ_sum - u_J * I_sum - u_I * J_sum + (u_I * u_J) * W_sum
+            I_var = I2_sum - 2 * u_I * I_sum + (u_I * u_I) * W_sum
+            J_var = J2_sum - 2 * u_J * J_sum + (u_J * u_J) * W_sum
+
+            win_size = float(np.prod(win))
+            valid = W_sum > 0
+
+            cc = cross * cross / (I_var * J_var + eps)
+
+            # Only average over valid regions
+            cc = torch.where(valid, cc, torch.zeros_like(cc))
+            valid_count = valid.float().sum().clamp_min(1.0)
+            cc_mean = cc.sum() / valid_count
+        else:
             I2 = Ii * Ii
             J2 = Ji * Ji
             IJ = Ii * Ji
@@ -113,70 +83,30 @@ class NCC:
             cross = IJ_sum - u_J * I_sum - u_I * J_sum + u_I * u_J * win_size
             I_var = I2_sum - 2 * u_I * I_sum + u_I * u_I * win_size
             J_var = J2_sum - 2 * u_J * J_sum + u_J * u_J * win_size
-        else:
-            # --- Weighted path: proper weighted local NCC ---
-            # Per-window mass (sum of weights)
-            W_sum = conv_fn(W, sum_filt, stride=stride, padding=padding).clamp_min(1e-6)
 
-            I_sum  = conv_fn(Ii * W,  sum_filt, stride=stride, padding=padding)
-            J_sum  = conv_fn(Ji * W,  sum_filt, stride=stride, padding=padding)
-            I2_sum = conv_fn((Ii * Ii) * W, sum_filt, stride=stride, padding=padding)
-            J2_sum = conv_fn((Ji * Ji) * W, sum_filt, stride=stride, padding=padding)
-            IJ_sum = conv_fn((Ii * Ji) * W, sum_filt, stride=stride, padding=padding)
-
-            u_I = I_sum / W_sum
-            u_J = J_sum / W_sum
-
-            # Covariance and variances with weights
-            cross = IJ_sum - u_J * I_sum - u_I * J_sum + (u_I * u_J) * W_sum
-            I_var = I2_sum - 2 * u_I * I_sum + (u_I * u_I) * W_sum
-            J_var = J2_sum - 2 * u_J * J_sum + (u_J * u_J) * W_sum
-
-        cc = cross * cross / (I_var * J_var + eps)
-
-        if W is None:
+            cc = cross * cross / (I_var * J_var + eps)
             cc_mean = cc.mean()
-        else:
-            # valid = (W_sum > 1e-6).to(cc.dtype)
-            # cc_mean = (cc * valid).sum() / valid.sum().clamp_min(1.0)
-            cc_mean = (cc * W_sum).sum() / W_sum.sum().clamp_min(1.0)
 
-        return 1-cc_mean
+        return 1 - cc_mean
 
 
 class MSE:
     """
-    Mean squared error loss.
+    Mean squared error loss with optional binary masking.
     """
-
-    def __init__(
-        self,
-        sqrt: bool = False,
-        use_weights: bool = False,
-        # Parameters for build_anatomy_weights
-        p_air: float = 0.08,
-    ):
+    def __init__(self, sqrt: bool = False):
         self.sqrt = sqrt
-        self.use_weights = use_weights
-        self._w_params = dict(
-            p_air=p_air,
-        )
 
-    def loss(self, y_true: torch.Tensor, y_pred: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1e-6):
+    def loss(self, y_true: torch.Tensor, y_pred: torch.Tensor, mask: torch.Tensor = None, eps: float = 1e-6):
         diff = (y_true - y_pred) ** 2
 
-        # Build weights if requested and not provided
-        if weight is None and self.use_weights:
-            W = build_anatomy_weights(y_true, **self._w_params).to(y_true.dtype)
+        if mask is not None:
+            # Binary mask
+            W = (mask > 0).to(diff.dtype)
+            # Average only over masked region
+            mse = (diff * W).sum() / W.sum().clamp_min(eps)
         else:
-            W = None if weight is None else weight.to(y_true.dtype)
-
-        if W is None:
             mse = diff.mean()
-        else:
-            num = (W * diff).sum()
-            den = W.sum().clamp_min(eps)
-            mse = num / den
 
         return torch.sqrt(mse) if self.sqrt else mse
 
@@ -185,7 +115,6 @@ class Dice:
     """
     N-D dice for segmentation
     """
-
     def loss(self, y_true, y_pred):
         ndims = len(list(y_pred.size())) - 2
         vol_axes = list(range(2, ndims + 2))
@@ -199,7 +128,6 @@ class Grad:
     """
     N-D gradient loss.
     """
-
     def __init__(self, penalty='l1', loss_mult=None):
         self.penalty = penalty
         self.loss_mult = loss_mult
@@ -221,20 +149,15 @@ class Grad:
             grad *= self.loss_mult
         return grad
 
+
 class KL:
     """
     Kullback–Leibler divergence between 2 Gaussian distributions.
     """
-
     def __init__(self, prior=True):
         self.prior = prior
 
     def loss(self, _, param):
-        """
-        Parameters:
-            param: list with means and log variances
-        """
-        
         if self.prior: 
             p = torch.distributions.multivariate_normal.MultivariateNormal(
                 param['p_mu'],

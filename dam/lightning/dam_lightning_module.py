@@ -84,9 +84,9 @@ class DamLightning(LightningModule):
             self.build_model(self.trainer.datamodule.inshape)
 
         if self._image_loss_name == "ncc":
-            self.img_loss = dam.losses.NCC(device=self.device, use_weights=True).loss
+            self.img_loss = dam.losses.NCC(device=self.device).loss
         elif self._image_loss_name == "mse":
-            self.img_loss = dam.losses.MSE(use_weights=True).loss
+            self.img_loss = dam.losses.MSE().loss
         else:
             raise ValueError(f"Invalid image_loss: {self._image_loss_name}")
 
@@ -169,12 +169,14 @@ class DamLightning(LightningModule):
         return (img - bmin) / (bmax - bmin + 1e-8)
 
     def _prepare_batch(self, batch: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
-        inputs, y_true, pmasks, rmasks = batch
+        inputs, y_true, pmasks, rmasks, pamask, ramask = batch
         return dict(
             inputs=inputs.float().permute(0, 4, 1, 2, 3),
             y_true=y_true.float().permute(0, 4, 1, 2, 3),
             pmasks=pmasks.to(torch.int64).permute(0, 4, 1, 2, 3),
             rmasks=rmasks.to(torch.int64).permute(0, 4, 1, 2, 3),
+            pamask=pamask.to(torch.int64).permute(0, 4, 1, 2, 3),
+            ramask=ramask.to(torch.int64).permute(0, 4, 1, 2, 3),
         )
 
     def _model_outputs_to_dict(self, y_pred, bidir: bool) -> Dict[str, Any]:
@@ -187,10 +189,17 @@ class DamLightning(LightningModule):
             return {"rep": rep, "mrep": mrep, "svf": svf, "param": param}
 
     # -------------------------- Visuals & metric panels --------------------------
-    def _build_pair_panel(self, planning2d: torch.Tensor, gt2d: torch.Tensor, rc2d: torch.Tensor) -> tuple[wandb.Image, Dict[str, float]]:
+    def _build_pair_panel(
+        self, 
+        planning2d: torch.Tensor, 
+        gt2d: torch.Tensor, 
+        rc2d: torch.Tensor,
+        mask2d: torch.Tensor = None
+    ) -> tuple[wandb.Image, Dict[str, float]]:
         """
-        Build a 5-panel figure (planning, GT, recon, overlay, |diff|) and return
-        a WandB image plus per-pair metrics (MSE, PSNR, NCC).
+        Build a panel figure with:
+        - planning, GT, recon, |diff|
+        - if mask provided: adds GT+mask overlay panel
         Inputs are 2D tensors on CPU (normalized to [0,1] recommended).
         """
         pl = planning2d.numpy()
@@ -199,22 +208,37 @@ class DamLightning(LightningModule):
 
         gt01 = self._to01_np(gt)
         rc01 = self._to01_np(rc)
-        overlay = np.stack([rc01, gt01, rc01], axis=-1)
         diff = np.abs(gt01 - rc01)
 
         mse = float(np.mean((gt01 - rc01) ** 2))
         psnr = self._psnr01(gt01, rc01)
         ncc = self._ncc(gt01, rc01)
 
-        fig, axs = plt.subplots(1, 5, figsize=(15, 3), constrained_layout=True)
+        # Create figure - add extra panel if mask provided
+        ncols = 5 if mask2d is not None else 4
+        fig, axs = plt.subplots(1, ncols, figsize=(3*ncols, 3), constrained_layout=True)
+        
+        # Standard panels
         axs[0].imshow(pl, cmap="gray"); axs[0].set_title("Planning", fontsize=10); axs[0].axis("off")
         axs[1].imshow(gt, cmap="gray"); axs[1].set_title("GT Repeat", fontsize=10); axs[1].axis("off")
         axs[2].imshow(rc, cmap="gray"); axs[2].set_title("Recon Repeat", fontsize=10); axs[2].axis("off")
-        axs[3].imshow(overlay); axs[3].set_title("Overlay (G=GT, M=Recon)", fontsize=10); axs[3].axis("off")
-        im = axs[4].imshow(diff, cmap="magma")
-        axs[4].set_title(f"|GT−Recon|\nMSE={mse:.4f}  PSNR={psnr:.2f}  NCC={ncc:.3f}", fontsize=9)
-        axs[4].axis("off")
-        plt.colorbar(im, ax=axs[4], fraction=0.046, pad=0.04)
+        im = axs[3].imshow(diff, cmap="magma")
+        axs[3].set_title(f"|GT−Recon|\nMSE={mse:.4f}  PSNR={psnr:.2f}  NCC={ncc:.3f}", fontsize=9)
+        axs[3].axis("off")
+        plt.colorbar(im, ax=axs[3], fraction=0.046, pad=0.04)
+
+        # Add mask overlay if provided
+        if mask2d is not None:
+            mask_np = mask2d.numpy()
+            # Create red-tinted overlay where mask is active
+            mask_overlay = np.stack([
+                gt01,  # R channel: use GT
+                gt01 * (1 - mask_np),  # G channel: GT dimmed by mask
+                gt01 * (1 - mask_np),  # B channel: GT dimmed by mask
+            ], axis=-1)
+            axs[4].imshow(mask_overlay)
+            axs[4].set_title("GT + Anatomy Mask", fontsize=10)
+            axs[4].axis("off")
 
         panel = wandb.Image(fig)
         plt.close(fig)
@@ -223,52 +247,53 @@ class DamLightning(LightningModule):
     def _maybe_log_examples(
         self,
         *,
-        stage: str,                               # "train" or "val"
-        inputs: torch.Tensor,                     # [B, C, X, Y, Z]
-        y_true: torch.Tensor,                     # [B, C, X, Y, Z]
-        pred: Dict[str, torch.Tensor],            # outputs dict
+        stage: str,
+        inputs: torch.Tensor,
+        y_true: torch.Tensor,
+        pred: Dict[str, torch.Tensor],
         limit: int,
-        eval_gate: bool,                          # whether this epoch is an eval-logging epoch
+        eval_gate: bool,
+        anatomy_mask: torch.Tensor = None,  # [B,C,X,Y,Z] anatomy mask
     ) -> None:
-        """
-        Optionally log example panels + grad-MAE, and accumulate stage metrics.
-        Uses only up to 'limit' samples from the current batch.
-        """
+        """Added anatomy_mask parameter to visualize mask overlay"""
         if not eval_gate:
             return
         wb = self._wandb()
         if wb is None:
             return
 
-        # Select k samples
         k = min(limit, y_true.size(0))
         if k <= 0:
             return
 
-        recon = pred["rep"][:k]                  # [k,1,X,Y,Z]
-        yt_k  = y_true[:k]                       # [k,1,X,Y,Z]
-        in_k  = inputs[:k]                       # [k,C,X,Y,Z]
+        recon = pred["rep"][:k]
+        yt_k = y_true[:k]
+        in_k = inputs[:k]
+        mask_k = anatomy_mask[:k] if anatomy_mask is not None else None
 
-        # Build panels
         panels = []
-        for i in range(k):        
+        for i in range(k):
             pl2d = self._normalize01(self._pick_slice(in_k[i:i+1]))[0].detach().cpu()
             gt2d = self._normalize01(self._pick_slice(yt_k[i:i+1]))[0].detach().cpu()
             rc2d = self._normalize01(self._pick_slice(recon[i:i+1]))[0].detach().cpu()
-            panel, _ = self._build_pair_panel(pl2d, gt2d, rc2d)
+            # Get corresponding mask slice if available
+            mask2d = self._pick_slice(mask_k[i:i+1])[0].detach().cpu() if mask_k is not None else None
+            panel, _ = self._build_pair_panel(pl2d, gt2d, rc2d, mask2d)
             panels.append(panel)
 
-        # Log with stage-specific key + epoch
         wb.experiment.log({f"{stage}/examples_gt_vs_recon": panels, "epoch": self.current_epoch})
 
     # -------------------------- Core step --------------------------
 
     def _step(self, batch: Tuple[torch.Tensor, ...], stage: str) -> Dict[str, torch.Tensor]:
         """
-        batch: (planning, repeat, planning_mask, repeat_mask) as [B, X, Y, Z, C]
+        batch: (planning, repeat, planning_mask, repeat_mask, planning_anat_mask, repeat_anat_mask) as [B,X,Y,Z,C]
         """
         b = self._prepare_batch(batch)
-        inputs, y_true, pmasks, rmasks = b["inputs"], b["y_true"], b["pmasks"], b["rmasks"]
+        inputs, y_true = b["inputs"], b["y_true"]
+        pmasks, rmasks = b["pmasks"], b["rmasks"]
+        pamask = b.get("pamask", None)
+        ramask = b.get("ramask", None)
 
         # forward pass
         y_pred = self.model(inputs, y_true, pmasks, rmasks)
@@ -281,12 +306,12 @@ class DamLightning(LightningModule):
         # compose losses
         comps: Dict[str, torch.Tensor] = {}
         if self.bidir:
-            comps["img_fwd"]  = self.img_loss(y_true,  pred["rep"]) * self.hparams.lambda_img
-            comps["img_bwd"]  = self.img_loss(inputs, pred["inv"]) * self.hparams.lambda_img
+            comps["img_fwd"]  = self.img_loss(y_true,  pred["rep"], mask=ramask) * self.hparams.lambda_img
+            comps["img_bwd"]  = self.img_loss(inputs, pred["inv"], mask=pamask) * self.hparams.lambda_img
             comps["dice_fwd"] = self.dice_loss(rm_bin, pred["mrep"]) * self.hparams.kappa
             comps["dice_bwd"] = self.dice_loss(pm_bin, pred["minv"]) * self.hparams.kappa
         else:
-            comps["img"]  = self.img_loss(y_true,  pred["rep"])   * self.hparams.lambda_img
+            comps["img"]  = self.img_loss(y_true,  pred["rep"], mask=ramask)   * self.hparams.lambda_img
             comps["dice"] = self.dice_loss(rm_bin, pred["mrep"]) * self.hparams.kappa
 
         comps["grad"] = self.grad_loss(None, pred["svf"]) * self.hparams.beta
@@ -305,7 +330,7 @@ class DamLightning(LightningModule):
 
         self.log(f"{stage}/loss_total", total, on_step=False, on_epoch=True, sync_dist=True)
 
-        return {"loss": total, "inputs": inputs, "y_true": y_true, "pred": pred}
+        return {"loss": total, "inputs": inputs, "y_true": y_true, "pred": pred, "masks": ramask}
 
     # -------------------------- Lightning hooks --------------------------
 
@@ -324,6 +349,7 @@ class DamLightning(LightningModule):
                 pred=out["pred"],
                 limit=remain,
                 eval_gate=True,
+                anatomy_mask=out["masks"],
             )
             # advance pair counter
             k_used = min(remain, out["y_true"].size(0))
@@ -347,11 +373,12 @@ class DamLightning(LightningModule):
             pred=out["pred"],
             limit=self.evaluate_num_pairs,
             eval_gate=do_eval_epoch,
+            anatomy_mask=out["masks"],
         )
 
     def on_validation_epoch_end(self):
         if (self.current_epoch + 1) % self.evaluate_every_n_epochs == 0:
-            self._val_vs_elx_ncc_count.zero_()
+            self._eval_pairs_logged.zero_()
 
     # ------------------------------ Optimizer --------------------------------
 
